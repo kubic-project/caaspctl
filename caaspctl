@@ -1,0 +1,1647 @@
+#!/usr/bin/env python
+
+import argparse
+import glob as gb
+import json
+import logging
+import os
+import os.path as op
+import re
+import readline
+import socket
+import subprocess
+import sys
+import time
+import traceback
+import yaml
+from cmd import Cmd
+from datetime import datetime, timedelta
+from tempfile import NamedTemporaryFile
+
+try:
+    # for Python 2.x
+    from StringIO import StringIO
+except ImportError:
+    # for Python 3.x
+    from io import StringIO
+
+
+# logging format
+# https://docs.python.org/2/library/logging.html#logrecord-attributes
+FORMAT = '# %(asctime)s [%(levelname)s] %(message)s'
+
+# the version for this
+VERSION = "0.1"
+
+# some orchestrations and arguments
+ORCH_DEFAULT = 'kubernetes'
+ORCH_REMOVAL = 'removal'
+ORCH_ADDITION = 'addition'
+ORCH_OPTS = "-l debug --force-color --hard-crash"
+
+# some key container (partial) names
+CONTAINER_SALT_MASTER = "salt-master"
+CONTAINER_SALT_API = "salt-api"
+CONTAINER_VELUM = "velum-dashboard"
+CONTAINER_MARIADB = "velum-mariadb"
+CONTAINER_OPENLDAP = "openldap"
+
+CONTAINER_START_TIMEOUT = 300
+
+# where admin certificates will be generated to
+CERT_ADMIN_DIR = "/root/certs"
+
+UPDATE_GRAIN = "tx_update_reboot_needed"
+
+# the database we use
+DB_NAME = "velum_production"
+
+# password file in the database container
+DB_PASSWORD_FILE = '/var/lib/misc/infra-secrets/mariadb-root-password'
+
+# command for inserting in the database, querying, etc...
+# - pillar
+DB_INSERT_PILLAR_CMD = \
+    'DELETE FROM pillars WHERE pillar=\'{key}\' AND value=\'{value}\'; ' + \
+    'INSERT INTO pillars (pillar, value) VALUES (\'{key}\', \'{value}\');'
+DB_QUERY_PILLAR_CMD = 'SELECT * FROM pillars;'
+DB_FLUSH_PILLAR_CMD = 'TRUNCATE TABLE pillars;'
+# - minions
+DB_QUERY_MINIONS_CMD = 'SELECT * FROM minions;'
+# - events
+DB_QUERY_EVENTS_CMD = 'SELECT data FROM salt_events ORDER BY alter_time;'
+DB_FLUSH_EVENTS_CMD = 'TRUNCATE TABLE salt_events;'
+
+# RC files that are automatically loaded on startup
+# can be used for doing some actions or setting default values
+CAASPCTL_RC_FILES = [
+    '.caaspctl.rc',
+    '.caaspctlrc',
+    'caaspctl.rc',
+    'caaspctlrc',
+    '~/.caaspctl.rc',
+    '~/.caaspctlrc',
+    '~/caaspctl.rc',
+    '~/caaspctlrc'
+]
+
+COLORS = {
+    'HEADER': '\033[95m',
+    'BLUE': '\033[94m',
+    'GREEN': '\033[92m',
+    'RED': '\033[91m',
+    'ENDC': '\033[0m',
+    'BOLD': '\033[1m',
+    'UNDERLINE': '\033[4m'
+}
+
+PROMPT_COLORS = ['UNDERLINE', 'BLUE']
+
+# fields exported in CSV files
+CSV_FIELDS = ['orch', 'jid', 'node', 'start', 'end', 'stage', 'name', 'result']
+
+####################################################################
+# Command line arguments
+####################################################################
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    description='A utility for managing CaaSP',
+    epilog="")
+
+parser.add_argument('args',
+                    nargs=argparse.REMAINDER,
+                    help='commands to run (get more info with "help")')
+
+verbose_group = parser.add_argument_group(
+    title='Logging/verbosity')
+
+verbose_group.add_argument('--debug',
+                           dest='debug',
+                           default=False,
+                           action='store_true',
+                           help='use debug logging')
+
+script_group = parser.add_argument_group(
+    title='Loadding commands from scripts')
+
+script_group.add_argument('--script',
+                          dest='script',
+                          metavar='FILE',
+                          default='',
+                          help='read a list of commands from a script')
+script_group.add_argument('--script-only',
+                          dest='script_only',
+                          default=True,
+                          action='store_true',
+                          help='quit after running the script')
+script_group.add_argument('--script-begin',
+                          dest='script_begin',
+                          metavar='STAGE',
+                          default='',
+                          help='process the script after stage <STAGE>')
+
+database_group = parser.add_argument_group(
+    title='Misc')
+
+database_group.add_argument('--database',
+                            dest='database',
+                            metavar='DB',
+                            default=DB_NAME,
+                            help='database to use')
+
+commands_group = parser.add_argument_group(
+    title='Commands processing',
+    description='How commands are processed from command line or from the loop')
+
+commands_group.add_argument('--loop',
+                            dest='loop',
+                            default=False,
+                            action='store_true',
+                            help='the loop is only started when no commands are provided in command line. With this flag, the loop is started even when commands are provided as arguments')
+commands_group.add_argument('--commands-pre',
+                            dest='commands_pre',
+                            default=False,
+                            action='store_true',
+                            help='process commands from arguments BEFORE processing scripts')
+commands_group.add_argument('--exit-on-error',
+                            dest='exit_on_err',
+                            default=False,
+                            action='store_true',
+                            help='exit on any errors instead of just printing the error message')
+commands_group.add_argument('--skip-rc-files',
+                            dest='skip_rc_files',
+                            default=False,
+                            action='store_true',
+                            help='do not load automatically the RC files')
+
+args = parser.parse_args()
+
+
+loglevel = (logging.DEBUG if args.debug else logging.INFO)
+log = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stderr,
+                    format=FORMAT,
+                    level=loglevel)
+
+try:
+    import coloredlogs
+
+    # By default the install() function installs a handler on the root logger,
+    # this means that log messages from your code and log messages from the
+    # libraries that you use will all show up on the terminal.
+    coloredlogs.install(fmt=FORMAT, level=loglevel)
+except ImportError:
+    log.debug('"coloredlogs" not available')
+
+readline.set_completer_delims(' \t\n')
+
+####################################################################
+# Aux
+####################################################################
+
+
+def get_assign_from_str(line):
+    res = {}
+
+    if len(line) == 0:
+        return res
+
+    try:
+        assert(isinstance(line, str))
+        for assign in line.split(','):
+            var = assign.split('=')
+            variable = var[0].lstrip()
+            value = var[1].lstrip()
+            value = value_to_native(value)
+
+            res[variable] = value
+    except IndexError as e:
+        log.debug('could not parse assignments in "%s": %s', line, e)
+
+    return res
+
+
+def execute(cmd, sudo=False, password=None):
+    ''' Execute a command '''
+    assert(isinstance(cmd, str))
+
+    for line in cmd.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if sudo:
+            if password:
+                cmd = "echo %s | sudo -S %s" % (password, line)
+            else:
+                cmd = "sudo -S %s" % (line)
+        else:
+            cmd = line
+
+        log.debug('Running "%s"', cmd)
+        popen = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
+        for stdout_line in iter(popen.stdout.readline, ""):
+            yield stdout_line
+
+        popen.stdout.close()
+        return_code = popen.wait()
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, cmd)
+
+
+def execute_interactive(cmd, sudo=False, password=None):
+    ''' Execute an interactive command, returning the `retcode` '''
+    assert(isinstance(cmd, str))
+
+    if sudo:
+        cmd = "echo %s | sudo -S %s" % (password, cmd)
+
+    log.debug('Starting interactive command "%s"', cmd)
+    return subprocess.call(cmd, shell=True)
+
+
+def execute_now(cmd, strip_nls=True):
+    res = []
+    for line in cmd.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        out = str(subprocess.check_output(line, shell=True))
+        if strip_nls:
+            out = out.strip('\n')
+
+        res.append(out)
+
+    if strip_nls:
+        return ' '.join(res)
+    else:
+        return '\n'.join(res)
+
+
+#########################
+# Network
+#########################
+
+def is_ip(name):
+    try:
+        socket.inet_aton(name)
+        return True
+    except socket.error:
+        return False
+
+
+#########################
+# Containers
+#########################
+
+
+class ContainerNotFoundException(Exception):
+    pass
+
+
+class ContainerWaitTimeout(Exception):
+    pass
+
+
+def get_regular_container(name):
+    docker_ps_out = execute_now('docker ps')
+    for line in docker_ps_out.split('\n'):
+        fields = re.split('\s{2,}', line.strip())
+        cid = fields[0]
+        cname = fields[-1]
+        if name in cname:
+            return cid
+
+    return None
+
+
+def get_container(name):
+    return get_regular_container("k8s_{name}_velum".format(name=name))
+
+
+def get_cid(name):
+    ''' Get the real container for an 'alias' (like 'db' or 'salt') '''
+    if name in ['salt-master', 'salt']:
+        return get_container(CONTAINER_SALT_MASTER)
+    elif name in ['velum']:
+        return get_container(CONTAINER_VELUM)
+    elif name in ['mariadb', 'mysql', 'maria', 'db']:
+        return get_container(CONTAINER_MARIADB)
+    elif name in ['api', 'salt-api', 'API']:
+        return get_container(CONTAINER_SALT_API)
+    elif name in ['ldap', 'openldap']:
+        return get_container(CONTAINER_OPENLDAP)
+    else:
+        return get_container(name)
+
+
+def enter_container(name):
+    ''' Enter into the container '''
+    cid = get_cid(name)
+    if cid:
+        return execute_interactive('docker exec -ti {} /bin/sh'.format(cid))
+    else:
+        raise Exception('could not find container {}'.format(name))
+
+
+def attach_container(name):
+    cid = get_cid(name)
+    return execute_interactive('docker attach {}'.format(cid))
+
+
+def get_container_logs(name):
+    try:
+        c = get_cid(name)
+    except Exception as e:
+        log.debug('could not find container %s: %s', name, e)
+        raise ContainerNotFoundException(
+            'could not find container {name}'.format(name=name))
+
+    cmd = 'docker logs {}'.format(c)
+    for line in execute(cmd):
+        if line:
+            yield line
+
+
+def wait_for_container(name, timeout=CONTAINER_START_TIMEOUT):
+    '''Wait for a container to be up and running'''
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            cid = get_cid(name)
+            if cid:
+                log.debug('container %s is running with ID %s', name, cid)
+                return
+        except:
+            pass
+
+        log.debug('docker: waiting for "{}" ({} left)...'.format(
+            name, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise ContainerWaitTimeout('timeout while waiting for {}'.format(name))
+
+
+def exec_in_container(name, cmd, wait=False):
+    ''' Run a command in a container '''
+    if wait:
+        wait_for_container(name)
+
+    try:
+        c = get_cid(name)
+    except Exception as e:
+        log.debug('could not find container %s: %s', name, e)
+        c = None
+
+    if not c:
+        raise ContainerNotFoundException(
+            'could not find container {name}'.format(name=name))
+
+    cmd = 'docker exec {} {}'.format(c, cmd)
+    log.debug('docker: executing in "%s" command "%s"', c, cmd)
+    for line in execute(cmd):
+        if line:
+            yield line
+
+
+def restart_container(name):
+    ''' Restart a container '''
+    try:
+        c = get_cid(name)
+    except Exception as e:
+        log.debug('could not find container %s: %s', name, e)
+        raise ContainerNotFoundException(
+            'could not find container {name}'.format(**locals()))
+
+    log.info('Restarting container %s', name)
+    if c != None:
+        cmd = 'docker restart {c}'.format(**locals())
+        return execute_now(cmd)
+    else:
+        log.warn('docker: nothing to restart: it seems %s was not running', name)
+
+
+#########################
+# database
+#########################
+
+
+def get_db_password(filename=DB_PASSWORD_FILE):
+    ''' Get the database password '''
+    cmd = 'cat ' + filename
+    for line in exec_in_container('db', cmd, wait=True):
+        return line.strip()  # return only the first line
+
+
+def exec_sql_in_db(cmd, **kwargs):
+    ''' Run a SQL command in the database '''
+    password = get_db_password()
+    log.debug('Using password %s', password)
+    cmd = 'mysql -uroot -p\'{password}\' -B -t -e "{cmd}" {db}'.format(
+        cmd=cmd, db=args.database, password=password)
+    for line in exec_in_container('db', cmd, **kwargs):
+        yield line
+
+
+def wait_for_db(db=None, timeout=CONTAINER_START_TIMEOUT):
+    ''' Wait for a specific database to be ready '''
+    db = db or args.database
+    password = get_db_password()
+    log.debug('using password %s', password)
+
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            for line in exec_sql_in_db('SHOW DATABASES;'):
+                if db in line:
+                    log.debug('Database "%s" seems to be ready', db)
+                    return
+        except:
+            pass
+
+        log.info("Waiting for database {} ({} left)...".format(
+            db, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise ContainerWaitTimeout(
+        'timeout while waiting for database {}'.format(db))
+
+
+def pillar_db_insert(key, value, **kwargs):
+    ''' Insert a value for a pillar (replacing any previous value) '''
+    log.info('Adding pillar "%s"="%s"', key, value)
+    cmd = DB_INSERT_PILLAR_CMD.format(**locals())
+    for line in exec_sql_in_db(cmd, **kwargs):
+        yield line
+
+#########################
+# Salt
+#########################
+
+
+def get_salt_where_from(name):
+    if not name:
+        return '*'
+
+    try:
+        return {
+            '*': '*',
+            'all': '*',
+            'cluster': '*',
+            'ca': 'G@roles:ca',
+            'admin': 'G@roles:admin',
+            'kube-master': 'G@roles:kube-master',
+            'kube-masters': 'G@roles:kube-master',
+            'master': 'G@roles:kube-master',
+            'masters': 'G@roles:kube-master',
+            'kube-minion': 'G@roles:kube-minion',
+            'kube-minions': 'G@roles:kube-minion',
+            'minion': 'G@roles:kube-minion',
+            'minions': 'G@roles:kube-minion',
+            'nodes': 'P@roles:kube-(master|minion)',
+            'workers': 'P@roles:kube-(master|minion)'
+        }[name.lower()]
+    except KeyError:
+        return name
+
+
+def exec_in_salt(cmd,
+                 compound=None,
+                 color=False,
+                 newlines=True,
+                 ignore_stderr=True,
+                 out=None,
+                 salt_args='',
+                 debug=False,
+                 **kwargs):
+
+    debug_level = 'critical' if not debug else 'debug'
+    color_arg = '--force-color' if color else '--no-color'
+
+    if compound:
+        compound_arg = " -C '{}'".format(get_salt_where_from(compound))
+    else:
+        compound_arg = ''
+
+    cmd_args = '{compound_arg} --log-level={debug_level} {salt_args} '.format(
+        **locals())
+
+    if out:
+        cmd_args += ' --out={} --out-indent=4'.format(out)
+    elif newlines:
+        cmd_args += ' --out=newline_values_only '
+
+    # TODO: add other matchers
+
+    cmd = '/usr/bin/salt {cmd_args} {cmd}'.format(**locals())
+    if ignore_stderr:
+        cmd = cmd + ' 2>/dev/null'
+
+    for line in exec_in_container('salt', cmd, **kwargs):
+        if line:
+            yield line
+
+
+def exec_salt_runner(cmd, **kwargs):
+    opts = kwargs.pop('salt_args', ORCH_OPTS)
+    cmd = '/usr/bin/salt-run {} --force-color {}'.format(opts, cmd)
+    for line in exec_in_container('salt-master', cmd, **kwargs):
+        yield line
+
+
+def exec_salt_key(cmd, **kwargs):
+    cmd = '/usr/bin/salt-key --force-color ' + cmd
+    for line in exec_in_container('salt-master', cmd, **kwargs):
+        yield line
+
+
+def get_salt_keys(status='all'):
+    for line in exec_salt_key('-l ' + status, wait=True):
+        yield line
+
+
+def get_salt_keys_accepted():
+    for line in get_salt_keys(status='acc'):
+        yield line
+
+
+def get_salt_keys_rejected():
+    for line in get_salt_keys(status='rej'):
+        yield line
+
+
+def get_salt_keys_accepted_num():
+    out = list(exec_salt_key('-l acc', wait=True))
+    return len(out[1:])
+
+
+def wait_for_num_keys_accepted(num_keys, timeout=CONTAINER_START_TIMEOUT):
+    log.info("Waiting for %d Salt keys to be accepted...", num_keys)
+    wait_for_container('salt')
+
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        # accept all the pending keys
+        # this will fail if no keys have been submitted yet
+        try:
+            for line in exec_salt_key('--accept-all --yes'):
+                yield line
+        except:
+            pass
+
+        num_accepted = get_salt_keys_accepted_num()
+        if num_accepted >= num_keys:
+            return
+
+        log.info("Waiting for %d Salt keys to be accepted: %d accepted (%s secs left)...",
+                 num_keys, num_accepted, str(timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise ContainerWaitTimeout(
+        'timeout waiting for {} to be accepted'.format(num_keys))
+
+
+SALT_AVAIL_SYNC = ['all', 'engines', 'grains', 'beacons', 'utils', 'returners',
+                   'modules', 'renderers', 'log_handlers', 'states', 'sdb', 'proxymodules', 'output']
+
+
+def salt_sync(what='all'):
+    what = what.strip().lower()
+    if what not in SALT_AVAIL_SYNC:
+        raise CommandError('unknown sync target "{}"'.format(what))
+
+    log.info('Synchronizing %s', what)
+    cmd = 'saltutil.sync_{} refresh=True'.format(what)
+    for line in exec_in_salt(cmd, compound='*', wait=True):
+        yield line
+
+
+def grain_set(where, key, value):
+    log.info("Setting grain %s=%s in %s", key, value, where)
+    cmd = 'grains.set "{}" "{}"'.format(key, value)
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
+
+
+def grain_get(where, key):
+    log.info("Getting grain %s in %s", key, where)
+    cmd = 'grains.get {}'.format(key)
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
+
+
+def grain_ls(where):
+    log.info("Listing grains (in '%s')", where)
+    cmd = 'grains.ls'
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
+
+
+def grain_items(where):
+    log.info("Listing grains (in '%s')", where)
+    cmd = 'grains.items'
+    for line in exec_in_salt(cmd, compound=where,
+                             wait=True,
+                             out='yaml'):
+        yield line
+
+#########################
+# aux
+#########################
+
+
+def get_role_nodenames(role, timeout=CONTAINER_START_TIMEOUT):
+    ''' Get the nodename for all the nodes with a specific role '''
+    log.debug("get-role-nodenames: getting nodenames for {}...".format(role))
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            for line in grain_get(role, 'nodename'):
+                yield line
+        except Exception as e:
+            log.warning(
+                'get-role-nodenames: while waiting for nodename for %s: %s', role, e)
+
+        log.debug("get-role-nodenames: waiting for result for {} ({} left)...".format(
+            role, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise Exception('could not get nodename for {}'.format(role))
+
+
+def get_role_ip(role, timeout=CONTAINER_START_TIMEOUT):
+    ''' Get the IP for a random node with a specific role '''
+    log.debug("get-role-ip: getting IP for {}...".format(role))
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            for line in exec_in_salt('network.interface_ip eth0',
+                                     compound=role.strip(),
+                                     color=False, wait=True):
+                res = line.strip()  # return only the first line
+                if is_ip(res):
+                    log.debug('get-role-ip: obtained IP for %s: %s', role, res)
+                    return str(res)
+        except Exception as e:
+            log.debug('get-role-ip: while waiting for IP for %s: %s', role, e)
+
+        log.debug("get-role-ip: waiting for IP for {} ({} left)...".format(
+            role, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise Exception('could not get IP for {}'.format(role))
+
+
+def get_master_ip(timeout=CONTAINER_START_TIMEOUT):
+    ''' Get the IP for a random kubernetes master '''
+    return get_role_ip('kube-master')
+
+
+#########################
+# Output/conversions
+#########################
+
+
+def str2bool(v):
+    return v.lower() in ("yes", "true", "t", "1")
+
+
+def replace_pattern(pat, replacer, line):
+    for t in re.finditer(pat, line):
+        txt = str(t.group())
+        out = replacer(txt)
+        line = line.replace(txt, out)
+    return line
+
+
+def value_to_native(val):
+    if isinstance(val, str):
+        try:
+            return int(val)
+        except ValueError:
+            pass
+
+        if val.lower() in ["true", "yes", "on"]:
+            return True
+        elif val.lower() in ["false", "no", "off"]:
+            return False
+
+        val = os.path.expandvars(val)
+
+        # in case it is a quoted string, remove them
+        if val[0] in ['\'', '"']:
+            return val[1:-1]
+
+    return val
+
+
+def parse_json_from_iter(it):
+    for line in it:
+        line = line.replace("\\", r"\\")
+        for t in re.finditer(r"\{.*\}", line):
+            try:
+                json_line = t.group()
+                json_line = json_line.replace('\\"', r'"')
+                json_line = json_line.replace('//', r'')
+                yield json.loads(json_line)
+            except ValueError as e:
+                log.error('JSON decoding error: %s on %s', e, json_line[:80])
+
+
+def expandvars(path):
+    return re.sub(r'(?<!\\)\$[A-Za-z_][A-Za-z0-9_]*', '', os.path.expandvars(path))
+
+
+def on_color(color, txt):
+    res = ''
+    if isinstance(color, list):
+        res += ''.join([COLORS[x] for x in color])
+    else:
+        res += COLORS[color]
+
+    return res + txt + COLORS['ENDC']
+
+
+def prompt(txt):
+    return on_color(PROMPT_COLORS, '{} >'.format(txt)) + ' '
+
+
+def print_iterator(it, **kwargs):
+    for line in it:
+        sys.stdout.write(line)
+
+
+def complete_path(path):
+    if op.isdir(path):
+        return gb.glob(op.join(path, '*'))
+    else:
+        return gb.glob(path + '*')
+
+####################################################################
+# Command-line processing
+####################################################################
+
+
+class CommandError(Exception):
+    pass
+
+
+class CmdBase(Cmd):
+
+    def __init__(self, top=None):
+        Cmd.__init__(self)
+        self.last_exc = None
+        self.blocked = False
+        self.current_script = ''
+        self.top = top
+
+    def abort(self):
+        self.do_traceback('')
+        log.critical(on_color('RED', 'aborting execution'))
+        sys.exit(1)
+
+    def is_interactive(self):
+        if self.top:
+            return self.top.is_interactive()
+        else:
+            return (self.stdin == sys.stdin)
+
+    def command_line_args(self, cmd_args):
+        line = ' '.join(cmd_args)
+        for command in line.split(';'):
+            self.onecmd(command)
+
+    def onecmd(self, line):
+        try:
+            if not self.blocked or line == 'EOF' or line.startswith('stage'):
+                return Cmd.onecmd(self, line)
+            else:
+                return False
+        except subprocess.CalledProcessError as e:
+            log.info(on_color('RED', 'Command error: ' + str(e)))
+            if args.exit_on_err or not self.is_interactive():
+                self.abort()
+        except KeyboardInterrupt as e:
+            log.info(on_color('RED', '[interrupted]'))
+            if args.exit_on_err or not self.is_interactive():
+                self.last_exc = sys.exc_info()
+                self.abort()
+
+    def cmdloop(self, intro=None):
+        self.interactive = True
+
+        if self.intro:
+            print(self.intro)
+
+        while True:
+            try:
+                Cmd.cmdloop(self, intro="")
+                self.postloop()
+                break
+            except subprocess.CalledProcessError as e:
+                log.info(on_color('RED', 'Command error: ' + str(e)))
+                if args.exit_on_err or not self.is_interactive():
+                    self.abort()
+            except KeyboardInterrupt as e:
+                log.info(on_color('RED', '[interrupted]'))
+                if args.exit_on_err or not self.is_interactive():
+                    self.last_exc = sys.exc_info()
+                    self.abort()
+            except Exception as e:
+                self.last_exc = sys.exc_info()
+
+                if not self.is_interactive():
+                    # we are running in batch mode
+                    log.critical(
+                        on_color('RED', 'exception catched in batch mode: %s'), e)
+                    self.abort()
+
+                log.critical(on_color('RED', 'exception catched !!! %s'), e)
+                log.critical(
+                    on_color('RED', 'get more details with "traceback".'))
+
+    def precmd(self, line):
+        if line.lstrip().startswith('#'):
+            return ''
+
+        if len(line.strip()) == 0:
+            return line
+
+        # replace all the `some-shell-command`
+        def sh_replacer(text):
+            cmd = text[1:-1]  # remove the ``
+            log.debug('replacing %s by shell output', cmd)
+            out = subprocess.check_output(
+                cmd, stderr=subprocess.STDOUT, shell=True)
+            return out.decode('utf-8').rstrip()
+        line = replace_pattern(r"`.*`", sh_replacer, line)
+
+        # replace all the {% some-python-code %}
+        def python_replacer(text):
+            code = text[2:-2]  # remove the {%%}
+            log.debug('replacing %s by python evaluation', code)
+            return str(self.eval(code))
+        line = replace_pattern(r"\{\%.*\%\}", python_replacer, line)
+
+        line = expandvars(line)
+
+        return line
+
+    def default(self, line):
+        line = line.lstrip()
+
+        if line.startswith('>'):
+            # evaluate python code
+            return self.do_eval(line[1:])
+
+        if line.startswith('!'):
+            # run a local command
+            return self.do_sh(line[1:])
+
+        if line == '..':
+            return True
+
+        Cmd.default(self, line)
+
+    def try_rc_files(self, rc_files):
+        log.debug('Trying to load RC files...')
+        for maybe_rc_file in rc_files:
+            maybe_rc_file = os.path.expandvars(maybe_rc_file)
+            if os.path.exists(maybe_rc_file):
+                try:
+                    self.load_script(maybe_rc_file)
+                except Exception as e:
+                    log.critical('Could not read rc file %s: %s',
+                                 maybe_rc_file, e)
+                    sys.exit(1)
+
+    def load_script(self, script):
+        log.info('Loading commands from "%s"', script)
+
+        old_stdin = caasp_cmd.stdin
+        old_prompt = caasp_cmd.prompt
+        old_intro = caasp_cmd.intro
+        old_use_rawinput = caasp_cmd.use_rawinput
+
+        self.use_rawinput = False
+        self.prompt = ''
+        self.intro = ''
+        self.current_script = os.path.abspath(script)
+
+        try:
+            with open(script, 'rt') as script_fd:
+                self.stdin = script_fd
+                self.cmdloop()
+        finally:
+            script_fd.close()
+
+            # restore the previous settings
+            self.stdin = old_stdin
+            self.prompt = old_prompt
+            self.intro = old_intro
+            self.use_rawinput = old_use_rawinput
+            self.current_script = ''
+
+    def do_load(self, line):
+        '''
+        Load a script with commands.
+        '''
+        filename = line
+        if not os.path.isabs(filename):
+            this_filename = os.path.realpath(__file__)
+            this_dirname = os.path.dirname(this_filename)
+            cur_script_dirname = os.path.dirname(self.current_script)
+
+            log.debug('try to guess the real name of %s', filename)
+            for i in [filename,
+                      os.path.join(this_dirname, filename),
+                      os.path.join(cur_script_dirname, filename)]:
+                log.debug('trying %s', i)
+                if os.path.exists(i):
+                    filename = i
+                    break
+
+        if os.path.exists(filename):
+            self.load_script(filename)
+        else:
+            log.error('could not load script at %s', filename)
+
+    def complete_do_load(self, text, line, start_idx, end_idx):
+        return complete_path(text)
+
+    def do_shell(self, line):
+        '''
+        Run a shell command in the local machine.
+        Notes:
+
+        * there is shortcut with the ! character (ie, "! ls -lisa")
+
+        Usage:
+
+        > sh ls /
+        > sh cat README.txt
+        > ! ls /
+        '''
+        if execute_interactive(line) != 0:
+            log.error('command failed')
+
+    def do_traceback(self, line):
+        '''Get a traceback for the last exception. '''
+        if self.last_exc:
+            traceback.print_exception(*self.last_exc)
+            self.last_exc = None
+
+    def do_quiet(self, line):
+        '''Set quiet mode.'''
+        args.debug = False
+        return True
+
+    def do_print(self, line):
+        '''Quit.'''
+        log.info(line)
+
+    def do_EOF(self, line):
+        return True
+
+    def do_quit(self, line):
+        '''Quit.'''
+        return self.do_EOF(line)
+
+    def eval(self, code):
+        gl = globals()
+        return eval(code, {'root': gl['caasp_cmd']}, {})
+
+    def do_eval(self, line):
+        print(self.eval(line))
+
+    def emptyline(self):
+        # ignore empty lines instead of repeating last command
+        pass
+
+    def do_stage(self, line):
+        '''
+        Mark the beginning of a new stage.
+        '''
+        if not line:
+            raise CommandError('no stage specified')
+
+        stage = line
+        log.debug('reached stage "%s" (waiting "%s")s',
+                  stage, args.script_begin)
+        if str(stage) == str(args.script_begin):
+            log.debug('stage %s reached: unblocking input', args.script_begin)
+            self.blocked = False
+
+
+###################
+# Salt stuff
+###################
+
+class CaaSPSalt(CmdBase):
+
+    prompt = prompt('caaspctl:salt')
+
+    def default(self, line):
+        '''
+        Run a raw command in the Salt master container
+
+        Usage:
+
+        > salt '*' test.ping
+        '''
+        log.info('Running Salt command %s', line)
+        print_iterator(exec_in_container('salt', 'salt ' + line))
+
+
+class CaaSPPillar(CmdBase):
+
+    prompt = prompt('caaspctl:pillar')
+
+    def do_set(self, line):
+        '''
+        Set a pillar in the database.
+
+        Usage:
+
+        > pillar set api:server:external_fqdn 192.168.122.4
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) != 2:
+            raise CommandError(
+                'set requires two arguments: the key and the value')
+
+        key, value = line_comps[0].strip(), line_comps[1].strip()
+        log.info('Setting the %s to %s', key, value)
+        print_iterator(pillar_db_insert(key, value, wait=True))
+
+    def do_load(self, line):
+        '''
+        Load pillar values from a file
+
+        The file is expected to be formed by lines with with form "<KEY> <VALUE>".
+        For example:
+
+        addons:tiller   true
+        addons:dns      true
+
+        Usage:
+
+        > pillar load /etc/pillars.lst
+        '''
+        filename = line
+        log.info('Loading pillars from %s', filename)
+        wait_for_db()
+        with open(filename, 'r') as f:
+            for line in f.readlines():
+                line = line.strip()
+
+                if not line or line.startswith('#'):
+                    continue
+
+                line_comps = re.split('\s{2,}', line.strip())
+                if len(line_comps) < 2:
+                    log.error('could not parse pillars line: "%s"', line)
+                    continue
+
+                key, value = line_comps[0].strip(), line_comps[1].strip()
+                print_iterator(pillar_db_insert(key, value))
+
+    def do_get(self, line):
+        '''
+        Get a pillar.
+
+        Usage:
+
+        > pillar get ca api:server:external_fqdn
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) >= 2:
+            key, where = line_comps
+            cmd = 'pillar.get {key}'.format(**locals())
+        elif len(line_comps) == 1:
+            print(line_comps)
+            where = 'ca'
+            key = line_comps[0]
+            cmd = 'pillar.get {key}'.format(**locals())
+        else:
+            where = 'ca'
+            key = 'all'
+            cmd = 'pillar.items'.format(**locals())
+
+        log.info('Getting %s at %s', key, where)
+        out_it = exec_in_salt(cmd, compound=where,
+                              color=True, out='yaml', wait=True)
+        print_iterator(out_it)
+
+    def do_db(self, line):
+        '''
+        Get the list of pillars in the database.
+
+        Usage:
+
+        > pillar db
+        '''
+        log.info('Getting pillar database')
+        print_iterator(exec_sql_in_db(DB_QUERY_PILLAR_CMD, wait=True))
+
+    def do_flush(self, line):
+        '''
+        Flush the pillars database.
+
+        Important: this will not get rid of all the pillars Salt
+                   obtains from the pillar/*.sls files.
+
+        Usage:
+
+        > pillar flush
+        '''
+        log.info('Flushing pillar database')
+        print_iterator(exec_sql_in_db(DB_FLUSH_PILLAR_CMD, wait=True))
+
+    def do_refresh(self):
+        '''
+        Refresh the pillar in the minions.
+        '''
+        log.info('Refreshing pillars')
+        print_iterator(exec_in_salt('saltutil.refresh_pillar', compound='*'))
+
+
+class CaaSPGrains(CmdBase):
+
+    prompt = prompt('caaspctl:grains')
+
+    def do_set(self, line):
+        '''
+        Set a grain for a node (or group of nodes).
+
+        Usage:
+
+        > grains set 'G@kube-master' nodename master
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) != 3:
+            raise CommandError(
+                'set requires three arguments: where, key and value')
+
+        where, key, value = line_comps[0].strip(
+        ), line_comps[1].strip(), line_comps[2].strip()
+        log.info('Setting the %s to %s at %s', key, value, where)
+        print_iterator(grain_set(where, key, value))
+
+    def do_get(self, line):
+        '''
+        Get a pillar.
+
+        Usage:
+
+        > grains get ca nodename
+        > grains get ca *
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) >= 2:
+            where, key = line_comps
+        elif len(line_comps) == 1:
+            where = '*'
+            key = line_comps[0]
+        else:
+            raise CommandError('Invalid number of arguments')
+
+        log.info('Getting %s at %s', key, where)
+        if key.strip() == '*':
+            print_iterator(grain_items(where))
+        else:
+            print_iterator(grain_get(where, key))
+
+
+###################
+# Database
+###################
+
+class CaaSPDb(CmdBase):
+
+    prompt = prompt('caaspctl:db')
+
+    def do_pillar(self, line):
+        log.info('Getting the pillar from the database')
+        print_iterator(exec_sql_in_db(DB_QUERY_PILLAR_CMD, wait=True))
+
+    def do_tables(self, line):
+        log.info('Showing tables in the database')
+        print_iterator(exec_sql_in_db('SHOW TABLES;', wait=True))
+
+    def do_minions(self, line):
+        log.info('Getting the list of minions from the database')
+        print_iterator(exec_sql_in_db(DB_QUERY_MINIONS_CMD, wait=True))
+
+    def do_exec(self, line):
+        log.info('Running mariadb command')
+        print_iterator(exec_sql_in_db(line, wait=True))
+
+    def do_wait(self, line):
+        log.info('Waiting for database')
+        wait_for_db()
+
+###################
+# Minions
+###################
+
+
+class CaaSPMinions(CmdBase):
+
+    prompt = prompt('caaspctl:minions')
+
+    def do_db(self, line):
+        log.info('Getting the list of minions from the database')
+        print_iterator(exec_sql_in_db(DB_QUERY_MINIONS_CMD, wait=True))
+
+    def do_ls(self, line):
+        '''
+        List all the minions the Salt master knows about.
+        '''
+        print_iterator(get_salt_keys())
+
+    def do_accepted(self, line):
+        '''
+        Print the minions accepted
+        '''
+        log.info('Minions accepted')
+        print_iterator(get_salt_keys_accepted())
+
+    def do_num_accepted(self, line):
+        '''
+        Print the number of minions accepted so far.
+        '''
+        log.info('Number of minions accepted')
+        print(get_salt_keys_accepted_num())
+
+    def do_accept(self, line):
+        '''
+        Block waiting for (at least) NUM minions to be accepted
+
+        Usage:
+
+        # block waiting until 6 minions have been accepted
+        > accept 6
+        '''
+        if not line:
+            raise CommandError('must provide a number')
+
+        num = int(line)
+
+        log.info('Waiting for (at least) %d minions to be accepted', num)
+        print_iterator(wait_for_num_keys_accepted(num))
+        print_iterator(get_salt_keys_accepted())
+
+    def do_rejected(self, line):
+        '''
+        Print the list of minions that have been rejected.
+        '''
+        log.info('Minions rejected')
+        print_iterator(get_salt_keys_rejected())
+
+    def do_masters(self, line):
+        '''
+        Print the list of nodes where the kube-master role has been assigned
+        '''
+        log.info('Masters:')
+        print_iterator(get_role_nodenames('masters'))
+
+    def do_minions(self, line):
+        '''
+        Print the list of nodes where the kube-minion role has been assigned
+        '''
+        log.info('Minions:')
+        print_iterator(get_role_nodenames('minions'))
+
+
+###################
+# Orchestrations
+###################
+
+
+class OrchestrationFailure(Exception):
+    pass
+
+
+class CaaSPOrch(CmdBase):
+
+    prompt = prompt('caaspctl:orch')
+
+    def _run_orchestration(self, orch, orch_args='', pillar={}):
+        assert(orch)
+        orchestration = orch or ORCH_DEFAULT
+
+        log.info('orchestration: starting "%s"...', orch)
+
+        if pillar:
+            orch_args += ' pillar=\'{}\''.format(
+                json.dumps(pillar, separators=(',', ':')))
+
+        if len(orch_args) > 0:
+            log.info('orchestration: arguments: %s', orch_args)
+
+        print_iterator(salt_sync())
+
+        log.info('orchestration: doing %s for real...', orch)
+        cmd = 'state.orchestrate orch.{orch} {orch_args}'.format(**locals())
+        try:
+            for line in exec_salt_runner(cmd, salt_args=ORCH_OPTS):
+                sys.stdout.write(line)
+        except Exception as e:
+            raise OrchestrationFailure(
+                'orchestration {} failed: {}'.format(orch, e))
+        else:
+            log.info('orchestration: %s finished', orch)
+
+    def default(self, line):
+        line_comps = line.split(' ')
+        orch = line_comps[0]
+        orch_args = ' '.join(line_comps[1:])
+        self._run_orchestration(orch, orch_args)
+
+    def do_boot(self, line):
+        '''Run the bootstrap orchestration.'''
+        self._run_orchestration(ORCH_DEFAULT, line)
+
+    def do_update(self, line):
+        '''
+        Run the update orchestration.
+        '''
+        self._run_orchestration('update', line)
+
+    def do_update_set_needed(self, line):
+        '''
+        Set the update-is-needed flag in all the machines in the cluster.
+        '''
+        grain_set(line, UPDATE_GRAIN, 'true')
+
+    def do_rm(self, line):
+        '''
+        Run the removal orchestration, for the node ID provided.
+
+        Usage:
+
+        > orch rm 923ac3ef4a554371b2e247e22ef9b0c8
+        '''
+        if not line:
+            raise CommandError(
+                'the removal orchestration needs a node as an argument')
+
+        node_id = line.strip()
+        pillar = {
+            "target": node_id
+        }
+        self._run_orchestration(ORCH_REMOVAL, pillar=pillar)
+
+    def do_add(self, line):
+        '''
+        Run the addition orchestration, for the node(s) ID(s) provided.
+
+        Usage:
+
+        > orch add 923ac3ef4a554371b2e247e22ef9b0c8
+        '''
+        if not line:
+            raise CommandError(
+                'the additional orchestration needs a node as an argument')
+
+        node_id = line.strip()
+        pillar = {
+            "target": node_id
+        }
+        self._run_orchestration(ORCH_ADDITION, pillar=pillar)
+
+
+###################
+# Orchestrations
+###################
+
+
+class CaaSPContainers(CmdBase):
+
+    prompt = prompt('caaspctl:cont')
+
+    # specific to caaspctl
+
+    def do_enter(self, line):
+        '''
+        Enter into a container (equivalent to `docker exec -ti CID /bin/sh`)
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont enter salt
+        > cont enter openldap
+        '''
+        if not line:
+            raise CommandError('needs a container name or ID')
+
+        container = line.strip()
+        log.info('Entering %s container', container)
+        enter_container(container)
+        log.info('Leaving %s container', container)
+
+    def do_wait(self, line):
+        '''
+        Wait for a container to be running.
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont wait db
+        '''
+        if not line:
+            raise CommandError('needs a container name or ID')
+
+        container = line.strip()
+        log.info('Waiting for %s container', container)
+        wait_for_container(container)
+        log.info('%s container is ready', container)
+
+    def do_cid(self, line):
+        '''
+        The the container ID for a symbolic name (ie, 'db', 'salt-master')
+        '''
+        if not line:
+            raise CommandError('needs a container name')
+
+        name = line.strip()
+        print(get_cid(name))
+
+    def do_exec(self, line):
+        '''
+        Execute a command in a container.
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont exec db ls /
+        > cont exec salt-master salt '*' test.ping
+        '''
+        line_comps = line.split(' ')
+        if len(line_comps) < 2:
+            raise CommandError('insufficient arguments')
+
+        container = line_comps[0].strip()
+        cmd = ' '.join(line_comps[1:])
+
+        log.info('Executing "%s" in container %s', cmd, container)
+        print_iterator(exec_in_container(container, cmd))
+
+    def do_logs(self, line):
+        '''
+        Get the logs for a container.
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont logs ldap
+        '''
+        if not line:
+            raise CommandError('container not provided')
+
+        container = line.strip()
+
+        log.info('Dumping logs for "%s"', container)
+        cid = get_cid(container)
+        if not cid:
+            log.warning('could not find container %s', container)
+        else:
+            print_iterator(execute('docker logs ' + cid))
+
+    def do_restart(self, line):
+        '''
+        Restart a container (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont restart ldap
+        '''
+        if not line:
+            raise CommandError('needs a container name')
+
+        name = line.strip()
+        restart_container(name)
+
+###################
+# Main
+###################
+
+
+class CaaSP(CmdBase):
+    """ CaaSP command line """
+
+    prompt = prompt('caaspctl')
+    intro = "CaaSP control tool.\n"
+
+    def __init__(self):
+        CmdBase.__init__(self)
+        self.salt = CaaSPSalt(self)
+        self.pillar = CaaSPPillar(self)
+        self.grains = CaaSPGrains(self)
+        self.db = CaaSPDb(self)
+        self.orch = CaaSPOrch(self)
+        self.minions = CaaSPMinions(self)
+        self.cont = CaaSPContainers(self)
+
+    def _subcommand(self, sub_cmd, line):
+        if len(line) > 0:
+            sub_cmd.onecmd(line)
+        else:
+            sub_cmd.cmdloop()
+
+    def do_salt(self, line):
+        '''Salt commands.'''
+        self._subcommand(self.salt, line)
+
+    def do_pillar(self, line):
+        '''Salt pillar commands.'''
+        self._subcommand(self.pillar, line)
+
+    def do_grains(self, line):
+        '''Salt grains commands.'''
+        self._subcommand(self.grains, line)
+
+    def do_db(self, line):
+        '''Database commands.'''
+        self._subcommand(self.db, line)
+
+    def do_orch(self, line):
+        '''Orchestration commands.'''
+        self._subcommand(self.orch, line)
+
+    def do_minions(self, line):
+        '''Minions commands.'''
+        self._subcommand(self.minions, line)
+
+    def do_cont(self, line):
+        '''Containers commands.'''
+        self._subcommand(self.cont, line)
+
+    def do_version(self, line):
+        '''
+        Print the version.
+        '''
+        print(VERSION)
+        return True
+
+
+#############################################################
+# Main
+#############################################################
+
+if __name__ == '__main__':
+    caasp_cmd = CaaSP()
+
+    if not args.skip_rc_files:
+        caasp_cmd.try_rc_files(CAASPCTL_RC_FILES)
+
+    if len(args.args) > 0 and args.commands_pre:
+        caasp_cmd.command_line_args(args.args)
+
+    if args.script:
+        if args.script_begin:
+            log.info('Will start execution at stage "%s"', args.script_begin)
+            caasp_cmd.blocked = True
+
+        for script in args.script:
+            try:
+                caasp_cmd.load_script(script)
+            except Exception as e:
+                log.critical('Could not read file %s: %s', script, e)
+                sys.exit(1)
+
+        caasp_cmd.blocked = False
+
+        if args.script_only:
+            log.debug('we were running only scripts: exitting...')
+            sys.exit(0)
+
+    if len(args.args) > 0 and not args.commands_pre:
+        caasp_cmd.command_line_args(args.args)
+
+    if not args.args or args.loop:
+        caasp_cmd.cmdloop()
