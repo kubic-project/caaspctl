@@ -899,7 +899,7 @@ class CmdBase(Cmd):
 
         if line.startswith('!'):
             # run a local command
-            return self.do_sh(line[1:])
+            return self.do_shell(line[1:])
 
         if line == '..':
             return True
